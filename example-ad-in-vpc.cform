@@ -1,0 +1,416 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "Creates a private VPC hosting a Microsoft ActiveDirectory, and a peered VPC hosting a Windows server to manage the AD (optionally with Elastic IP)",
+    "Parameters" : {
+        "AdminPassword" : {
+            "Description" : "The password of the Admin account of the AD",
+            "Type" : "String",
+            "NoEcho" : "true"
+        },
+        "ADCidrAddress" : {
+            "Default" : "10.0",
+            "Description" : "Initial two values for CIDR address for the VPC hosting the ActiveDirectory, which will be expanded X.Y.0.0/16",
+            "Type" : "String",
+            "MinLength" : "3",
+            "MaxLength" : "7",
+            "AllowedPattern" : "[0-9]?[0-9]?[0-9]\\.[0-9]?[0-9]?[0-9]",
+            "ConstraintDescription" : "Must create a valid CIDR"
+        },
+        "ADMgrCidrAddress" : {
+            "Default" : "10.1",
+            "Description" : "Initial two values for CIDR address for the VPC hosting the Windows server that manages the ActiveDirectory, which will be expanded X.Y.0.0/16",
+            "Type" : "String",
+            "MinLength" : "3",
+            "MaxLength" : "7",
+            "AllowedPattern" : "[0-9]?[0-9]?[0-9]\\.[0-9]?[0-9]?[0-9]",
+            "ConstraintDescription" : "Must create a valid CIDR"
+        },
+        "AllowedCIDRRange" : {
+            "Description" : "CIDR range for clients to access the VPC via SSH or RDP - this is the CIDR of the JumpBox VPC",
+            "Type" : "String",
+            "MinLength" : "10",
+            "MaxLength" : "18",
+            "AllowedPattern" : "[0-9]?[0-9]?[0-9].[0-9]?[0-9]?[0-9].[0-9]?[0-9]?[0-9].[0-9]?[0-9]?[0-9]/[1-3]?[0-9]",
+            "ConstraintDescription" : "Must be a valid CIDR"
+        },
+        "AllowIngressToADMgr" : {
+            "Description" : "If true, then an Elastic IP will be created and attached to the ADMgr server",
+            "Type" : "String",
+            "Default" : "true",
+            "AllowedValues" : [ "true", "false" ]  
+        },
+        "DomainName" : {
+            "Default" : "corp.example.com",
+            "Description" : "The fully qualified Domain Name - e.g. corp.example.com",
+            "Type" : "String"
+        },
+        "InstanceAmiId" : {
+            "Description" : "The Windows2016 AMI to be used for the EC2 instances",
+            "Type" : "String"
+        },
+        "InstanceType" : {
+            "Description" : "The Instance Type to be used for the EC2 instances",
+            "Default" : "m4.large",
+            "Type" : "String"
+        },
+        "KeyName" : {
+            "Description" : "The KeyName to access the EC2 instances",
+            "Type" : "String",
+            "NoEcho" : "true"
+        },
+        "VPCTemplateURL" : {
+            "Description" : "The URL to the template to create the VPC (see https://github.com/gford1000-aws/vpc/blob/master/create_vpc.cform)",
+            "Type" : "String"
+        } 
+	},
+    "Conditions" : {
+        "CreateEIPAccess" : { "Fn::Equals" : [ { "Ref" : "AllowIngressToADMgr" }, "true" ] }
+    },
+	"Resources" : {
+        "ADVPC" : {
+            "Type" : "AWS::CloudFormation::Stack",
+            "Properties" : {
+                "Parameters" : {
+                    "CidrAddress" : { "Ref" : "ADCidrAddress" },
+                    "CreatePublicSubnet" : "false",
+                    "EnableDnsSupport" : "false",
+                    "PrivateSubnetCount" : "2"
+                },
+                "TemplateURL" : { "Ref" : "VPCTemplateURL" }
+            }
+        },
+        "MgrVPC" : {
+            "Type" : "AWS::CloudFormation::Stack",
+            "Properties" : {
+                "Parameters" : {
+                    "CidrAddress" : { "Ref" : "ADMgrCidrAddress" },
+                    "CreatePublicSubnet" : { "Ref" : "AllowIngressToADMgr" },
+                    "EnableDnsSupport" : "false",
+                    "PrivateSubnetCount" : "3"
+                },
+                "TemplateURL" : { "Ref" : "VPCTemplateURL" }
+            }
+        },
+        "Peering" : {
+            "Type" : "AWS::EC2::VPCPeeringConnection",
+            "Properties" : {
+                "PeerVpcId" : { "Fn::GetAtt" : [ "ADVPC", "Outputs.VPC" ] },
+                "VpcId" : { "Fn::GetAtt" : [ "MgrVPC", "Outputs.VPC" ] }
+            }
+        },
+        "ADVPCRoute" : {
+            "Type" : "AWS::EC2::Route",
+            "Properties" : {
+                "DestinationCidrBlock": { "Fn::GetAtt" : [ "MgrVPC", "Outputs.CidrBlock" ] },
+                "RouteTableId" : { "Fn::GetAtt" : [ "ADVPC", "Outputs.PrivateSubnetRouteTable" ] },
+                "VpcPeeringConnectionId" : { "Ref" : "Peering" }
+            }
+        },
+        "MgrVPCRoute" : {
+            "Type" : "AWS::EC2::Route",
+            "Properties" : {
+                "DestinationCidrBlock": { "Fn::GetAtt" : [ "ADVPC", "Outputs.CidrBlock" ] },
+                "RouteTableId" : { "Fn::GetAtt" : [ "MgrVPC", "Outputs.PrivateSubnetRouteTable" ] },
+                "VpcPeeringConnectionId" : { "Ref" : "Peering" }
+            }
+        },
+        "Directory" : {
+            "Type" : "AWS::DirectoryService::MicrosoftAD",
+            "Properties" : {
+                "Name" :  { "Ref" : "DomainName" },
+                "Password" : { "Ref" : "AdminPassword" },
+                "VpcSettings" : { 
+                    "SubnetIds" : [ 
+                        { "Fn::Select" : [ "0", { "Fn::Split" : [ ",", { "Fn::GetAtt" : [ "ADVPC", "Outputs.PrivateSubnets" ] } ] } ] },
+                        { "Fn::Select" : [ "1", { "Fn::Split" : [ ",", { "Fn::GetAtt" : [ "ADVPC", "Outputs.PrivateSubnets" ] } ] } ] }
+                    ],
+                    "VpcId" : { "Fn::GetAtt" : [ "ADVPC", "Outputs.VPC" ] }
+                }
+            }
+        },  
+        "MgrSecurityGroup" : {
+            "Type" : "AWS::EC2::SecurityGroup",
+            "Properties" : {
+                "GroupDescription" : "Security Group for AD Manager Server",
+                "VpcId" : { "Fn::GetAtt" : [ "MgrVPC", "Outputs.VPC" ] },
+                "SecurityGroupIngress" : [
+                    {
+                        "IpProtocol" : "tcp", 
+                        "FromPort" : "3389", 
+                        "ToPort" : "3389", 
+                        "CidrIp" : { "Ref" : "AllowedCIDRRange" }
+                    }
+                ],
+                "SecurityGroupEgress" : [
+                    {
+                        "IpProtocol" : "tcp", 
+                        "FromPort" : "1", 
+                        "ToPort" : "65535", 
+                        "CidrIp" : { "Fn::GetAtt" : [ "ADVPC", "Outputs.CidrBlock" ] }
+                    },
+                    {
+                        "IpProtocol" : "tcp", 
+                        "FromPort" : "49152", 
+                        "ToPort" : "65535", 
+                        "CidrIp" : { "Ref" : "AllowedCIDRRange"}
+                    }
+                ]
+            }
+        },
+        "MgrRole" : {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "ec2.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [ ]
+            }
+        },
+        "MgrInstanceProfile": {
+            "Type": "AWS::IAM::InstanceProfile",
+            "Properties": {
+                "Path": "/",
+                "Roles": [ { "Ref" : "MgrRole" } ]
+            }
+        },
+        "MgrLaunchConfig" : {
+            "Type": "AWS::AutoScaling::LaunchConfiguration",
+            "DependsOn" : "Directory",
+            "Properties" : {
+                "AssociatePublicIpAddress" : false,
+                "ImageId" : { "Ref" : "InstanceAmiId" },
+                "InstanceType" : { "Ref" : "InstanceType" },
+                "IamInstanceProfile" : { "Ref" : "MgrInstanceProfile" },
+                "KeyName" : { "Ref" : "KeyName" },
+                "SecurityGroups" : [ 
+                    { "Ref" : "MgrSecurityGroup" } 
+                ],
+                "UserData" : {
+                    "Fn::Base64" : {
+                        "Fn::Join" : [ "\n",
+                            [
+                                "<persist></persist>",
+                                "<runAsLocalSystem></runAsLocalSystem>",
+                                "<powershell>",
+                                "if ( -not (Get-WmiObject -Class Win32_ComputerSystem).PartOfDomain )",
+                                "{",
+                                "    $adaptor = Get-NetAdapter",
+                                { 
+                                    "Fn::Sub" : [ 
+                                        "    Set-DNSClientServerAddress –interfaceIndex $adaptor.InterfaceIndex –ServerAddresses (\"${IP1}\", \"${IP2}\")",
+                                        {
+                                            "IP1" : { "Fn::Select" : [ "0", { "Fn::GetAtt" : [ "Directory", "DnsIpAddresses" ] } ] },
+                                            "IP2" : { "Fn::Select" : [ "1", { "Fn::GetAtt" : [ "Directory", "DnsIpAddresses" ] } ] }
+                                        }
+                                    ]
+                                },
+                                { "Fn::Sub" : [ "    $pass = ConvertTo-SecureString -String \"${Pwd}\" -AsPlainText -Force", { "Pwd" : { "Ref" : "AdminPassword" } } ] },
+                                "    $mycred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList “Admin”, $pass",
+                                { "Fn::Sub" : [ "    Add-Computer -Computer $env:COMPUTERNAME -Credential $mycred -DomainName \"${DomainName}\"", { "DomainName" : { "Ref" : "DomainName" } } ] },
+                                "    Restart-Computer -Force",
+                                "}",
+                                "</powershell>"
+                            ]
+                        ]
+                    }
+                }
+            }
+        },
+        "MgrAutoScalingGroup" : {
+            "Type" : "AWS::AutoScaling::AutoScalingGroup",
+            "Properties" : {
+                "DesiredCapacity" : "1",
+                "LaunchConfigurationName" : { "Ref" : "MgrLaunchConfig" },
+                "MinSize" : "1",
+                "MaxSize" : "1",
+                "NotificationConfigurations" : {
+                    "Fn::If" : [
+                        "CreateEIPAccess", 
+                        [
+                            {
+                                "TopicARN" : { "Ref" : "ADMgrLaunchTopic" },
+                                "NotificationTypes" : [ "autoscaling:EC2_INSTANCE_LAUNCH" ]
+                            }
+                        ],
+                        { "Ref" : "AWS::NoValue" }
+                    ]
+                },
+                "VPCZoneIdentifier" : {
+                    "Fn::If" : [
+                        "CreateEIPAccess",
+                        { "Fn::Split" : [ ",", { "Fn::GetAtt" : [ "MgrVPC", "Outputs.PublicSubnets" ] } ] },
+                        { "Fn::Split" : [ ",", { "Fn::GetAtt" : [ "MgrVPC", "Outputs.PrivateSubnets" ] } ] }
+                    ]
+                }
+                
+            }
+        },
+        "ADMgrLaunchTopic" : {
+            "Type" : "AWS::SNS::Topic",
+            "Condition" : "CreateEIPAccess",
+            "Properties" : {
+                "Subscription" : [
+                    { 
+                        "Endpoint" : { "Fn::GetAtt" : [ "LambdaEIPAssociation", "Arn" ] }, 
+                        "Protocol" : "lambda" 
+                    }
+                ]
+            }
+        },
+        "PermissionSNSToInvokeLambda": {
+            "Type": "AWS::Lambda::Permission",
+            "Condition" : "CreateEIPAccess",
+            "Properties": {
+                "FunctionName": { "Ref": "LambdaEIPAssociation" },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "sns.amazonaws.com",
+                "SourceArn": { "Ref" : "ADMgrLaunchTopic" }
+            }
+        },
+        "EIP" : {
+            "Type" : "AWS::EC2::EIP",
+            "Condition" : "CreateEIPAccess",
+            "Properties" : {
+                "Domain" : "vpc"
+            }
+        },        
+        "LambdaEIPAssociation" : {
+            "Type": "AWS::Lambda::Function",
+            "Condition" : "CreateEIPAccess",
+            "Properties" : {
+                "Code" : {
+                    "ZipFile" : {
+                        "Fn::Join": [
+                            "\n",
+                            [
+                                "import boto3",
+                                "from json import loads",
+                                "import os",
+                                "from uuid import uuid4",
+                                "",
+                                "EIP = os.environ['EIP']",
+                                "",
+                                "def lambda_handler(event, context):",
+                                "  try:",
+                                "    message = loads(event.get('Records', [{}])[0].get('Sns', {}).get('Message', \"{}\"))",
+                                "    instance_id = message.get('EC2InstanceId', '')",
+                                "    print(\"Associating {} to {}\".format(EIP, instance_id))",
+                                "    client = boto3.client('ec2')",
+                                "    client.associate_address(",
+                                "        AllocationId=EIP,",
+                                "        InstanceId=instance_id)",
+                                "  except Exception as e:",
+                                "    print(\"Unexpected exception: {}\".format(e))",
+                                ""
+                            ]
+                        ]
+                    }
+                },
+                "Description" : "Lambda associating Elastic IP to the AD Manager EC2 instance",
+                "Environment" : {
+                    "Variables" : {
+                        "EIP" : { "Fn::GetAtt": [ "EIP", "AllocationId" ] }
+                    }
+                },
+                "Handler" : "index.lambda_handler",
+                "MemorySize" : 128,
+                "Role" : { "Fn::GetAtt": [ "LambdaEIPAssociationRole", "Arn" ] },
+                "Runtime" : "python2.7",
+                "Timeout" : 5
+            }
+        },
+        "LambdaEIPAssociationRole": {
+            "Type": "AWS::IAM::Role",
+            "Condition" : "CreateEIPAccess",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "root",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ],
+                                    "Resource": "arn:aws:logs:*:*:*",
+                                    "Effect": "Allow"
+                                },
+                                {
+                                    "Effect":"Allow",
+                                    "Action": "ec2:AssociateAddress",
+                                    "Resource": "*"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+    },
+    "Outputs" : {
+        "ActiveDirectoryIPAddresses" : {
+            "Description" : "",
+            "Value" : { "Fn::Join" : [ ",", { "Fn::GetAtt" : [ "Directory", "DnsIpAddresses" ] } ] }
+        },
+        "ActiveDirectoryVPC" : {
+            "Description" : "ActiveDirectory VPC Name",
+            "Value" : { "Fn::GetAtt" : [ "ADVPC", "Outputs.VPC" ] }
+        },
+        "ActiveDirectoryVPCCidrBlock": {
+            "Description" : "The CIDR of the ActiveDirectory VPC",
+            "Value" : { "Fn::GetAtt" : [ "ADVPC", "Outputs.CidrBlock" ] }
+        },
+        "ActiveDirectoryVPCRouteTable" : {
+            "Description" : "Route table of the ActiveDirectory VPC",
+            "Value" : { "Fn::GetAtt" : [ "ADVPC", "Outputs.PublicSubnetRouteTable" ] }
+        },
+        "ManagerEIP" : {
+            "Description" : "Elastic IP of the AD Manager",
+            "Value" : {
+                "Fn::If" : [
+                    "CreateEIPAccess",
+                    { "Ref" : "EIP" },
+                    ""
+                ]
+            }
+        },
+        "ManagerVPC" : {
+            "Description" : "AD Manager VPC Name",
+            "Value" : { "Fn::GetAtt" : [ "MgrVPC", "Outputs.VPC" ] }
+        },
+        "ManagerVPCCidrBlock": {
+            "Description" : "The CIDR of the AD Manager VPC",
+            "Value" : { "Fn::GetAtt" : [ "MgrVPC", "Outputs.CidrBlock" ] }
+        },
+        "ManagerVPCRouteTable" : {
+            "Description" : "Route table of the AD Manager VPC",
+            "Value" : { "Fn::GetAtt" : [ "MgrVPC", "Outputs.PublicSubnetRouteTable" ] }
+        }
+    }
+}
